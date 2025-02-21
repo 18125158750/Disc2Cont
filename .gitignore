@@ -141,3 +141,7 @@ checkpoints
 
 outputs/
 runs/
+
+# MY TEMP
+*_t.py
+*_t*.py

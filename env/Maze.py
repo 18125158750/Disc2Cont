@@ -5,6 +5,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import pygame
 import os
+from collections import deque
 
 class BaseMazeEnv(gym.Env):
     metadata = {
@@ -65,13 +66,18 @@ class BaseMazeEnv(gym.Env):
 
         # 成功率追踪初始化
         if self.use_random_start:
-            self.success_counts = torch.zeros(len(self.valid_centers), dtype=torch.float32, device=self.device)
-            self.episode_counts = torch.ones(len(self.valid_centers), dtype=torch.float32, device=self.device) * 1e-6 # 避免除以零
+            self.success_history_deques = [deque(maxlen=10000) for _ in range(len(self.valid_centers))]
+            self._cached_success_rates = torch.zeros(len(self.valid_centers), dtype=torch.float32, device=self.device) # 使用 Tensor 缓存每个起始点的成功率
+            self._cached_average_success_rate = torch.tensor(0.5, dtype=torch.float32, device=self.device) # 使用 Tensor 缓存平均成功率
+            self._cache_update_interval = 1000 # 每隔多少步更新一次缓存 (设置为 1000)
+            self._cache_update_counter = 0
         else:
-            self.success_counts = None
-            self.episode_counts = None
+            self.success_history_deques = None
+            self._cached_success_rates = None
+            self._cached_average_success_rate = None
+            self._cache_update_interval = 0
+            self._cache_update_counter = 0
         self.start_indices = torch.zeros(num_envs, dtype=torch.long, device=self.device) # 记录每个环境的起始点索引
-
 
     def _init_positions(self, start_pos, end_pos):
         """初始化起点终点公共逻辑"""
@@ -185,13 +191,13 @@ class BaseMazeEnv(gym.Env):
 
         # 新增随机出生点逻辑
         if self.use_random_start:
-            # 计算成功率 (只针对需要重置的环境的起始点)
-            success_rates = self.success_counts / self.episode_counts
+            # 直接使用缓存的平均成功率，不再计算
+            success_rates = self._cached_success_rates
             success_rates = torch.clamp(success_rates, 0.0, 1.0)
 
             # 计算权重
-            weights = 5.0 - 3.0 * success_rates
-            weights = torch.clamp(weights, 2.0, 5.0)
+            weights = 10.0 - 9.0 * success_rates
+            weights = torch.clamp(weights, 1.0, 10.0)
 
             # 使用 torch.multinomial 进行带权重的随机选择 (只为需要重置的环境选择)
             num_to_reset = len(env_indices)
@@ -265,6 +271,36 @@ class BaseMazeEnv(gym.Env):
         final_info = []
         done_indices = torch.where(self.dones)[0]
 
+        # 计算 MASR (各个起始点权重相等)
+        if self.use_random_start:
+            current_batch_successes = success_mask[done_indices]
+            current_start_indices = self.start_indices[done_indices] # 获取完成环境的起始点索引
+
+            for i in range(len(done_indices)): # 遍历完成的环境
+                start_index = current_start_indices[i].item()
+                success = current_batch_successes[i].item()
+                self.success_history_deques[start_index].append(success) # 添加到对应起始点的 deque
+
+            # 定期计算成功率
+            if self._cache_update_counter % self._cache_update_interval == 0:
+                success_rates_list_np = [] # 使用 numpy list 临时存储，然后转 tensor
+                for i, deque_ in enumerate(self.success_history_deques):
+                    if deque_:
+                        success_rates_list_np.append(np.mean(deque_))
+                    else:
+                        success_rates_list_np.append(0.0)
+                if success_rates_list_np:
+                    self._cached_success_rates = torch.tensor(success_rates_list_np, dtype=torch.float32, device=self.device) # 更新缓存的每个起始点成功率
+                    self._cached_average_success_rate = torch.mean(self._cached_success_rates)
+                else:
+                    self._cached_average_success_rate = torch.tensor(0.5, dtype=torch.float32, device=self.device)
+
+
+            masr = self._cached_average_success_rate.item() # 直接使用缓存的平均成功率
+        else:
+            masr = float('nan')
+
+
         # 记录完成环境的信息
         for idx in done_indices:
             info = {
@@ -274,11 +310,7 @@ class BaseMazeEnv(gym.Env):
                 "collision": collision_mask[idx].item()
             }
             final_info.append(info)
-            if self.use_random_start:
-                start_index = self.start_indices[idx] # 获取起始点索引
-                self.episode_counts[start_index] += 1 # 增加 episode 计数
-                if success_mask[idx]:
-                    self.success_counts[start_index] += 1 # 成功时增加成功计数
+
 
 
         # 自动重置完成的环境
@@ -287,11 +319,8 @@ class BaseMazeEnv(gym.Env):
             self.reset(reset_indices)
 
         self.render()
+        self._cache_update_counter += 1 # 增加计数器
 
-        if self.use_random_start and torch.sum(self.episode_counts) > 0:
-            average_success_rate = torch.mean(self.success_counts / self.episode_counts)
-        else:
-            average_success_rate = torch.tensor(float('nan'), device=self.device) # 如果不使用随机起始点，则返回 NaN
 
         return (
             self.current_pos.clone(),
@@ -299,7 +328,7 @@ class BaseMazeEnv(gym.Env):
             terminated,
             truncated,
             {"final_info": final_info,
-             "MSR": average_success_rate} if final_info else {}  # 仅当有完成环境时返回
+             "MASR": masr} if final_info else {}  # 仅当有完成环境时返回
         )
 
 
@@ -347,12 +376,14 @@ class BaseMazeEnv(gym.Env):
                     pygame.draw.rect(canvas, colors["wall"], rect)
 
         # 绘制成功率方格
-        if self.use_random_start and self.success_counts is not None and self.episode_counts is not None:
+        if self.use_random_start and self.success_history_deques is not None:
             for i in range(len(self.valid_centers)):
                 cell_center = self.valid_centers[i]
                 cell_x = int(cell_center[0] - 0.5)
                 cell_y = int(cell_center[1] - 0.5)
-                success_rate = self.success_counts[i] / self.episode_counts[i]
+
+                success_rate = self._cached_success_rates[i].item() # 使用缓存的成功率
+
                 green_intensity = int(255-success_rate * 255)
                 green_intensity = max(0, min(green_intensity, 255)) # 确保在 0-255 范围内
                 success_color = (green_intensity, 255, green_intensity) # Green, darker for higher success rate
@@ -519,12 +550,15 @@ if __name__ == "__main__":
             # actions[:,1]=1
 
         # 环境交互
-        obs, rewards, dones, _, _ = env.step(actions)
+        obs, rewards, dones, _, info = env.step(actions)
         obs = torch.as_tensor(obs, device=device)
 
 
+        if info.get('MASR') is not None and not math.isnan(info.get('MASR')):
+             print(f"Moving Average Success Rate (MASR): {info['MASR']:.4f}") # 打印 MASR
+
         # print(f'Step {step},Done: {dones.cpu().item()},Obs: {obs.cpu().numpy()},Reward: {rewards.cpu().numpy()}')
-        # if env.render_mode == 'human': # 只有在 human 模式下才渲染，否则会影响速度
+        # if env.render_mode == 'human': # 只有在 human 模式下才渲染，否则 会影响速度
         #     env.render()
 
     env.close()

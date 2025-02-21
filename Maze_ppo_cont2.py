@@ -213,6 +213,7 @@ if __name__ == "__main__":
         'collisions': 0
     }
     best_score = -np.inf
+    last_msr = 0
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.observation_space.shape).to(device) # Get obs shape from MazeEnv
@@ -266,7 +267,7 @@ if __name__ == "__main__":
                         episode_stats['successes'] += 1
                     if info['collision']:
                         episode_stats['collisions'] += 1
-                msr = infos['MSR']
+                msr = infos['MASR']
 
         # 视频录制控制
         if args.capture_video and (update % args.video_interval == 0):
@@ -303,13 +304,17 @@ if __name__ == "__main__":
                 "charts/avg_episode_length": avg_length,
                 "charts/max_episode_length": max_length,
                 "charts/success_rate": success_rate,
-                "charts/MSR": msr,
                 "charts/collision_rate": collision_rate,
                 "charts/SPS": sps,
                 "losses/learning_rate": optimizer.param_groups[0]["lr"],
                 "global_step": global_step,
                 "update": update,
             }, step=global_step)
+            if msr != last_msr:
+                wandb.log({
+                    "charts/MSR": msr,
+                }, step=global_step)
+                last_msr = msr
         
         # 重置统计
         episode_stats = {k: [] if isinstance(v, list) else 0 for k, v in episode_stats.items()}
