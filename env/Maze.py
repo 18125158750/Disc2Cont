@@ -14,9 +14,18 @@ class BaseMazeEnv(gym.Env):
         'video.frames_per_second': 30
     }
     def __init__(self, num_envs=1, maze_layout=None, start_pos=(8.5,3.5),
-                 end_pos=(6.5,6.5), step_length=0.2, render_mode=None,
-                 device='cuda:0', exploration_reward=0.0): # 添加 exploration_reward 参数
+                 end_pos=(9.5,8.5), step_length=0.2, render_mode=None,
+                 device='cuda:0', exploration_reward=0.0, action_repeat_probability=0.0,
+                 timeout=128, success_rate_influence=0.4):
         super().__init__()
+
+        if not hasattr(self, 'action_space'):
+            self.action_space = spaces.Box(
+                low=-step_length,
+                high=step_length,
+                shape=(2,),
+                dtype=np.float32
+            )
 
         # 公共参数初始化
         self.num_envs = num_envs
@@ -25,23 +34,23 @@ class BaseMazeEnv(gym.Env):
         self.step_length = step_length
         self.success_threshold = 0.5
         self.exploration_reward = exploration_reward # 保存探索奖励值
+        self.action_repeat_probability = action_repeat_probability # 保存动作重复概率
+        self.timeout = timeout
+        self.success_rate_influence = success_rate_influence
 
         # 初始化迷宫
         if maze_layout is None:
             self.maze = torch.tensor([
-                [1,1,1,1,1,1,1,1,1,1,1,1,1],  # Row 0
-                [1,0,0,0,0,0,1,0,0,0,0,0,1],  # Row 1
-                [1,0,1,1,1,0,1,0,1,1,1,0,1],  # Row 2
-                [1,0,1,0,1,0,1,0,1,0,1,0,1],  # Row 3
-                [1,0,1,0,0,0,1,0,0,0,1,0,1],  # Row 4
-                [1,0,0,1,1,0,0,0,1,1,0,0,1],  # Row 5
-                [1,1,0,0,0,0,0,0,0,0,0,1,1],  # Row 6 (包含中心点)
-                [1,0,0,1,1,0,0,0,1,1,0,0,1],  # Row 7
-                [1,0,1,0,0,0,1,0,0,0,1,0,1],  # Row 8
-                [1,0,1,0,1,0,1,0,1,0,1,0,1],  # Row 9
-                [1,0,1,1,1,0,1,0,1,1,1,0,1],  # Row 10
-                [1,0,0,0,0,0,1,0,0,0,0,0,1],  # Row 11
-                [1,1,1,1,1,1,1,1,1,1,1,1,1]   # Row 12
+                [1,1,1,1,1,1,1,1,1,1,1],
+                [1,0,1,1,1,1,0,0,0,0,1],
+                [1,0,0,0,1,0,0,1,1,0,1],
+                [1,1,1,0,1,0,1,1,0,0,1],
+                [1,1,0,0,0,0,1,1,1,1,1],
+                [1,0,0,1,1,0,1,0,0,0,1],
+                [1,0,1,1,0,0,0,0,1,0,1],
+                [1,0,0,1,0,1,1,0,1,1,1],
+                [1,1,1,1,0,0,1,0,0,0,1],
+                [1,1,1,1,1,1,1,1,1,1,1]
             ], device=self.device)
         else:
             self.maze = torch.tensor(maze_layout, device=self.device)
@@ -63,10 +72,14 @@ class BaseMazeEnv(gym.Env):
         self.steps = torch.zeros(num_envs, dtype=torch.int32, device=device)
         # 奖励追踪
         self.returns = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        # 全过程碰撞追踪
+        self.episode_collision = torch.zeros(num_envs, dtype=torch.bool, device=self.device) # 初始化全过程碰撞记录
+        # 上一次动作存储
+        self.last_actions = torch.zeros((num_envs,) + self.action_space.shape, dtype=torch.float32, device=self.device) # 初始化上一次动作为 0
 
         # 成功率追踪初始化
         if self.use_random_start:
-            self.success_history_deques = [deque(maxlen=10000) for _ in range(len(self.valid_centers))]
+            self.success_history_deques = [deque(maxlen=1000) for _ in range(len(self.valid_centers))]
             self._cached_success_rates = torch.zeros(len(self.valid_centers), dtype=torch.float32, device=self.device) # 使用 Tensor 缓存每个起始点的成功率
             self._cached_average_success_rate = torch.tensor(0.5, dtype=torch.float32, device=self.device) # 使用 Tensor 缓存平均成功率
             self._cache_update_interval = 1000 # 每隔多少步更新一次缓存 (设置为 1000)
@@ -108,6 +121,7 @@ class BaseMazeEnv(gym.Env):
         self.end_pos = torch.tensor(end_pos, device=self.device)
         self.end_pos_np = np.array(end_pos)
         self.current_pos = self.start_pos.clone()
+        self.initial_start_pos = self.start_pos.clone() # 保存初始起点位置
 
         # 探索奖励相关初始化
         self.visited_matrix = torch.zeros((self.num_envs, len(self.valid_centers)), dtype=torch.bool, device=self.device) # 访问记录矩阵
@@ -156,29 +170,7 @@ class BaseMazeEnv(gym.Env):
                         (new_pos[:, 1] < 0) | (new_pos[:, 1] >= self.rows)
 
         return (maze_values == 1) | out_of_bounds
-    def _vectorized_collision_detect(self, new_pos):
-        # 修改后的路径获取
-        path_coords = self._batch_get_visited_cells(self.current_pos, new_pos)  # 直接返回三维张量
 
-        # 调整维度处理 (batch_size, max_steps, 2)
-        grid_coords = path_coords.long()
-
-        # 创建有效掩码（使用逐元素判断）
-        valid_mask = (grid_coords[..., 0] >= 0) & (grid_coords[..., 0] < self.cols) & \
-                    (grid_coords[..., 1] >= 0) & (grid_coords[..., 1] < self.rows)
-
-        # 获取迷宫值（使用张量索引优化）
-        y_coords = torch.clamp(grid_coords[..., 1], 0, self.rows-1)
-        x_coords = torch.clamp(grid_coords[..., 0], 0, self.cols-1)
-        maze_values = self.maze[y_coords, x_coords]
-
-        # 计算碰撞（路径上有墙或越界）
-        collision_mask = (
-            (maze_values == 1).any(dim=1) |  # 路径上有墙
-            (~valid_mask.all(dim=1))         # 路径越界
-        )
-
-        return collision_mask
     # 以下为公共方法
     def reset(self, env_indices=None):
         if env_indices is None:
@@ -187,7 +179,8 @@ class BaseMazeEnv(gym.Env):
         self.steps[env_indices] = 0
         self.returns[env_indices] = 0
         self.visited_matrix[env_indices] = False # 重置指定环境的访问记录
-
+        self.episode_collision[env_indices] = False # 重置全过程碰撞记录
+        self.last_actions[env_indices] = 0.0 # 重置last_actions
 
         # 新增随机出生点逻辑
         if self.use_random_start:
@@ -196,8 +189,9 @@ class BaseMazeEnv(gym.Env):
             success_rates = torch.clamp(success_rates, 0.0, 1.0)
 
             # 计算权重
-            weights = 10.0 - 9.0 * success_rates
-            weights = torch.clamp(weights, 1.0, 10.0)
+            weights = 1.0 - self.success_rate_influence * success_rates
+            # weights = torch.ones_like(success_rates)
+            weights = torch.clamp(weights, (1.0 - self.success_rate_influence), 1.0)
 
             # 使用 torch.multinomial 进行带权重的随机选择 (只为需要重置的环境选择)
             num_to_reset = len(env_indices)
@@ -205,11 +199,13 @@ class BaseMazeEnv(gym.Env):
 
             self.current_pos[env_indices] = self.valid_centers[indices]
             self.start_indices[env_indices] = indices # 记录起始点索引 for reset envs
+            self.initial_start_pos[env_indices] = self.current_pos[env_indices].clone() # 更新初始起点位置
         else:
             # 原有固定起点逻辑
             if isinstance(env_indices, np.ndarray):
                 env_indices = torch.from_numpy(env_indices).to(self.device)
             self.current_pos[env_indices] = self.start_pos[env_indices]
+            self.initial_start_pos[env_indices] = self.start_pos[env_indices].clone() # 更新初始起点位置
 
 
         self.dones[env_indices] = False
@@ -217,15 +213,20 @@ class BaseMazeEnv(gym.Env):
 
     def step(self, actions):
         self.steps += 1  # 更新时间步
+
         # 动作转换交给子类实现
         action_vectors = self._convert_action(actions)
+
+        # 动作重复逻辑
+        repeat_action_mask = (torch.rand(self.num_envs, device=self.device) < self.action_repeat_probability)
+        selected_actions = torch.where(repeat_action_mask.unsqueeze(-1), self.last_actions, action_vectors) # 选择重复动作或新动作
 
         with torch.no_grad():
             new_pos = self.current_pos + action_vectors
             collision_mask = self._simple_collision_detect(new_pos)
             success_mask = torch.norm(new_pos - self.end_pos.float(), dim=1) < self.success_threshold
-            terminated = collision_mask | success_mask
-            truncated = self.steps >= 128
+            terminated = success_mask # 碰撞不再终止 episode, 只有成功才终止
+            truncated = self.steps >= self.timeout
             self.dones = terminated | truncated
 
             rewards = torch.where(success_mask, 10, torch.where(collision_mask, -1.0, torch.where(truncated,-0.5,0.0))) # 基础奖励
@@ -265,7 +266,16 @@ class BaseMazeEnv(gym.Env):
 
                 rewards += exploration_rewards # 将探索奖励加到总奖励中
             self.returns = self.returns + rewards
-            self.current_pos = torch.where(self.dones.unsqueeze(1), self.current_pos, new_pos)
+
+            # 更新全过程碰撞记录 (使用逻辑 OR)
+            self.episode_collision = self.episode_collision | collision_mask
+            # 更新 last_actions
+            self.last_actions = selected_actions
+
+            # 碰撞后返回当前环境的起点，否则更新位置
+            self.current_pos = torch.where(collision_mask.unsqueeze(1), self.initial_start_pos, new_pos)
+            self.current_pos = torch.where(self.dones.unsqueeze(1), self.current_pos, self.current_pos) # 保持done状态的位置不变，防止重置位置在done时发生
+
 
         # 构建info信息（仅返回完成环境的数据）
         final_info = []
@@ -274,12 +284,16 @@ class BaseMazeEnv(gym.Env):
         # 计算 MASR (各个起始点权重相等)
         if self.use_random_start:
             current_batch_successes = success_mask[done_indices]
+            current_episode_collisions = self.episode_collision[done_indices] # 获取完成episode的全程碰撞信息
             current_start_indices = self.start_indices[done_indices] # 获取完成环境的起始点索引
 
             for i in range(len(done_indices)): # 遍历完成的环境
                 start_index = current_start_indices[i].item()
                 success = current_batch_successes[i].item()
-                self.success_history_deques[start_index].append(success) # 添加到对应起始点的 deque
+                episode_collision = current_episode_collisions[i].item()
+                episode_success_no_collision = success and not episode_collision # 新的成功条件
+                self.success_history_deques[start_index].append(episode_success_no_collision) # 添加到对应起始点的 deque
+
 
             # 定期计算成功率
             if self._cache_update_counter % self._cache_update_interval == 0:
@@ -307,7 +321,7 @@ class BaseMazeEnv(gym.Env):
                 "steps": self.steps[idx].item(),
                 "returns": self.returns[idx].item(),
                 "success": success_mask[idx].item(),
-                "collision": collision_mask[idx].item()
+                "collision": self.episode_collision[idx].item() # 添加全过程碰撞信息
             }
             final_info.append(info)
 
@@ -315,7 +329,7 @@ class BaseMazeEnv(gym.Env):
 
         # 自动重置完成的环境
         if torch.any(self.dones):
-            reset_indices = done_indices.clone()
+            reset_indices = done_indices[self.dones[done_indices]].clone() # 仅对done=True的环境重置
             self.reset(reset_indices)
 
         self.render()
@@ -471,12 +485,6 @@ class ContinuousMaze(BaseMazeEnv):
     """连续动作环境"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.action_space = spaces.Box(
-            low=-self.step_length,
-            high=self.step_length,
-            shape=(2,),
-            dtype=np.float32
-        )
 
     def _convert_action(self, actions):
         if not isinstance(actions, torch.Tensor):
@@ -537,7 +545,8 @@ if __name__ == "__main__":
         render_mode='human',
         device=device,
         start_pos=None,
-        exploration_reward = 0.0 # 设置探索奖励为 0.5
+        exploration_reward = 0.0, # 设置探索奖励为 0.0
+        action_repeat_probability = 0.2 # 设置动作重复概率为 20%
     )
 
     # 训练循环
@@ -545,20 +554,17 @@ if __name__ == "__main__":
     for step in range(10000):
         # 生成动作
         with torch.no_grad():
-            actions = env.action_space.sample()
+            # actions = env.action_space.sample()
             # actions = torch.zeros((num_envs,2), device=device)
-            # actions[:,1]=1
+            actions = torch.zeros((num_envs,), device=device, dtype=torch.long)
+            actions[:]=0
 
         # 环境交互
         obs, rewards, dones, _, info = env.step(actions)
         obs = torch.as_tensor(obs, device=device)
 
-
-        if info.get('MASR') is not None and not math.isnan(info.get('MASR')):
-             print(f"Moving Average Success Rate (MASR): {info['MASR']:.4f}") # 打印 MASR
-
-        # print(f'Step {step},Done: {dones.cpu().item()},Obs: {obs.cpu().numpy()},Reward: {rewards.cpu().numpy()}')
-        # if env.render_mode == 'human': # 只有在 human 模式下才渲染，否则 会影响速度
-        #     env.render()
+        if info.get('final_info'):
+            for env_info in info['final_info']:
+                print(f"Episode Final Info: Steps: {env_info['steps']}, Returns: {env_info['returns']}, Success: {env_info['success']}, Episode Collision: {env_info['collision']}")
 
     env.close()
