@@ -229,7 +229,7 @@ class BaseMazeEnv(gym.Env):
             truncated = self.steps >= self.timeout
             self.dones = terminated | truncated
 
-            rewards = torch.where(success_mask, 10, torch.where(collision_mask, -1.0, torch.where(truncated,-0.5,0.0))) # 基础奖励
+            rewards = torch.where(success_mask, 10, torch.where(collision_mask, -1.0, torch.where(truncated,0.0,0.0))) # 基础奖励
 
             if self.exploration_reward>0:
                 # 计算探索奖励 (向量化)
@@ -530,7 +530,22 @@ class Discrete8Maze(BaseMazeEnv):
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, device=self.device, dtype=torch.long)
         return self._directions[actions]
+    
+class Discrete16Maze(BaseMazeEnv):
+    """十六方向离散动作环境"""
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.action_space = spaces.Discrete(16)
+        directions_list = []
+        for i in range(16):
+            angle = 2 * math.pi * i / 16
+            directions_list.append([math.cos(angle), math.sin(angle)])
+        self._directions = torch.tensor(directions_list, device=self.device) * self.step_length
 
+    def _convert_action(self, actions):
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=self.device, dtype=torch.long)
+        return self._directions[actions]
 
 # 使用示例
 if __name__ == "__main__":

@@ -10,13 +10,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.normal import Normal
+import gymnasium as gym
+from torch.distributions.categorical import Categorical # 导入 Categorical 分布
 
 def strtobool(s): # Replacement for strtobool
     if isinstance(s, bool):
         return s
     s = s.lower()
     return s in ('yes', 'true', 't', 'y', '1')
+
 def parse_args():
     # fmt: off
     parser = argparse.ArgumentParser()
@@ -31,7 +33,7 @@ def parse_args():
         help="是否使用 CUDA")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="是否使用 Weights and Biases (WandB) 跟踪实验")
-    parser.add_argument("--wandb-project-name", type=str, default="ppo-maze-continuous", 
+    parser.add_argument("--wandb-project-name", type=str, default="ppo-maze-discrete", # 修改 WandB 项目名称
         help="WandB 项目名称")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="WandB 实体 (团队)，用于组织项目")
@@ -41,13 +43,13 @@ def parse_args():
         help="视频捕获的频率，每 video-interval 个 updates 捕获一次")
 
     # 算法 (PPO) 超参数
-    parser.add_argument("--learning-rate", type=float, default=1e-4,
+    parser.add_argument("--learning-rate", type=float, default=2.5e-4, # 修改默认学习率
         help="优化器的学习率")
     parser.add_argument("--total-timesteps", type=int, default=5e8,
         help="实验的总时间步数")
     parser.add_argument("--num-envs", type=int, default=1024,
         help="并行环境的数量")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=256,
         help="每个环境每次策略 rollout 运行的步数")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="是否对策略和价值网络的学习率进行退火")
@@ -63,7 +65,7 @@ def parse_args():
         help="策略更新的 epochs 数量")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="是否标准化优势函数")
-    parser.add_argument("--clip-coef", type=float, default=0.2,
+    parser.add_argument("--clip-coef", type=float, default=0.1,
         help="PPO 裁剪系数")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="是否使用裁剪的价值函数损失")
@@ -75,7 +77,7 @@ def parse_args():
         help="梯度裁剪的最大范数")
     parser.add_argument("--target-kl", type=float, default=None,
         help="目标 KL 散度阈值，用于早停")
-    
+
     # 存储配置
     parser.add_argument("--save-freq", type=int, default=200,
         help="模型检查点保存频率 (updates)")
@@ -95,10 +97,10 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class Agent(nn.Module):
-    def __init__(self, envs): #envs is now MazeEnv
+    def __init__(self, envs): #envs is now MazeEnv, assume it has discrete action space
         super(Agent, self).__init__()
         obs_shape = envs.observation_space.shape[0] # Get observation shape from MazeEnv
-        action_shape = envs.action_space.shape[0] # Get action shape from MazeEnv
+        n_actions = envs.action_space.n # Get number of discrete actions from MazeEnv
 
         self.critic = nn.Sequential(
             layer_init(nn.Linear(np.array(obs_shape).prod(), 256)),
@@ -109,28 +111,26 @@ class Agent(nn.Module):
             nn.ELU(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
-        self.actor_mean = nn.Sequential(
+        self.actor = nn.Sequential(
             layer_init(nn.Linear(np.array(obs_shape).prod(), 256)),
             nn.ELU(),
             layer_init(nn.Linear(256, 128)),
             nn.ELU(),
             layer_init(nn.Linear(128, 64)),
             nn.ELU(),
-            layer_init(nn.Linear(64, action_shape), std=0.01), # Output layer for discrete actions
+            layer_init(nn.Linear(64, n_actions), std=0.01), # Output layer for discrete actions
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, action_shape)) # action_shape for Maze
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        logits = self.actor(x) # Actor 输出 logits
+        probs = Categorical(logits=logits) # 使用 Categorical 分布
         if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
+            action = probs.sample() # 从 Categorical 分布中采样动作
+        return action, probs.log_prob(action), probs.entropy(), self.critic(x) # 返回动作，log 概率，熵和价值
+
 
 import atexit
 def exit_handler():
@@ -145,11 +145,11 @@ if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S") # 生成时间戳，用于区分实验 runs
     run_name = f"{args.exp_name}-{timestamp}" # 实验 runs 名称，包含实验名和时间戳
     dirs = { # 定义实验相关的目录
-        'base': f"runs/MazeCont/{run_name}", # 实验 runs 根目录
-        'checkpoints': f"runs/MazeCont/{run_name}/checkpoints", # 检查点保存目录
-        'best': f"runs/MazeCont/{run_name}/best_models", # 最佳模型保存目录
-        'config': f"runs/MazeCont/{run_name}/config", # 配置文件保存目录
-        'videos': f"runs/MazeCont/{run_name}/videos" # 视频录制保存目录
+        'base': f"runs/MazeDisc8/{run_name}", # 实验 runs 根目录
+        'checkpoints': f"runs/MazeDisc8/{run_name}/checkpoints", # 检查点保存目录
+        'best': f"runs/MazeDisc8/{run_name}/best_models", # 最佳模型保存目录
+        'config': f"runs/MazeDisc8/{run_name}/config", # 配置文件保存目录
+        'videos': f"runs/MazeDisc8/{run_name}/videos" # 视频录制保存目录
     }
     for d in dirs.values(): # 循环创建所有目录
         os.makedirs(d, exist_ok=True) # exist_ok=True 表示目录已存在时不会报错
@@ -191,18 +191,20 @@ if __name__ == "__main__":
 
     # env setup
     # Import the Maze environment
-    from env.Maze import ContinuousMaze
-    step_length = 0.2
-    envs = ContinuousMaze(num_envs=args.num_envs, 
-                        #   render_mode="rgb_array" if args.capture_video else None, 
-                        render_mode=None,
+    from env.Maze import Discrete4Maze,Discrete8Maze,Discrete16Maze
+    step_length = 0.1
+    envs = Discrete8Maze(num_envs=args.num_envs,
+                        render_mode="rgb_array" if args.capture_video else None,
                         device=device,
                         step_length=step_length,
                         # start_pos=(8.5, 3.5),
                         start_pos=None,
                         exploration_reward = 0.0,
-                        action_repeat_probability=0.2,
+                        action_repeat_probability=0.10,
+                        timeout=256,
+                        success_rate_influence=0.0,
                         )
+    assert isinstance(envs.action_space, gym.spaces.Discrete), "Only discrete action space is supported" # 确保环境是离散动作空间
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -219,7 +221,7 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.observation_space.shape).to(device) # Get obs shape from MazeEnv
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.action_space.shape).to(device) # Get action shape from MazeEnv
+    actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device) # 存储离散动作，类型为 long
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -250,7 +252,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
                 values[step] = value.flatten()
-            actions[step] = action
+            actions[step] = action # 存储离散动作
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
@@ -354,7 +356,7 @@ if __name__ == "__main__":
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.observation_space.shape) # Get obs shape from MazeEnv
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.action_space.shape) # Get action shape from MazeEnv
+        b_actions = actions.reshape(-1) # 离散动作空间，action shape 变为 (batch_size,)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -368,7 +370,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds]) # 传入离散动作
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
