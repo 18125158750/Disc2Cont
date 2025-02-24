@@ -546,6 +546,39 @@ class Discrete16Maze(BaseMazeEnv):
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, device=self.device, dtype=torch.long)
         return self._directions[actions]
+    
+class DiscreteRandomActionMaze(BaseMazeEnv):
+    """16选8+1方向离散动作环境"""
+    # 每一次action之后会随机切换动作
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.action_space = spaces.Discrete(8+1)
+        self.directions_list = []
+        for i in range(16):
+            angle = 2 * math.pi * i / 16
+            self.directions_list.append([math.cos(angle), math.sin(angle)])
+        self.directions_list.append([0, 0])
+        # 从directions_list的前16个动作中任选一个加上最后一个动作作为self._directions
+        # 动作的步长范围为[0.5*self.step_length, self.step_length]
+        self._directions = torch.tensor(self.directions_list, device=self.device) * self.step_length
+
+    def _convert_action(self, actions):
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=self.device, dtype=torch.long)
+
+        # 采样
+        actions_sample = self._directions[actions]
+        # 重置方向
+        self._set_random_directions()
+        return actions_sample
+
+    def _set_random_directions(self):
+        """随机选择前16个方向,并设置到self._directions中"""
+        random_indices = torch.randperm(16, device=self.device)[:8]
+        selected_directions = [self.directions_list[i] for i in random_indices.tolist()]
+        selected_directions.append(self.directions_list[-1])
+        random_scales = (torch.rand(8, device=self.device) * 0.5 + 0.5).unsqueeze(-1) # 变成(16,1)
+        self._directions = torch.tensor(selected_directions, device=self.device) * self.step_length * random_scales
 
 # 使用示例
 if __name__ == "__main__":
@@ -555,7 +588,7 @@ if __name__ == "__main__":
 
     # 直接创建环境实例
     # env = ContinuousMaze(
-    env = Discrete8Maze(
+    env = DiscreteRandomActionMaze(
         num_envs=num_envs,
         render_mode='human',
         device=device,
