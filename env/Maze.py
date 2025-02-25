@@ -197,7 +197,7 @@ class BaseMazeEnv(gym.Env):
             num_to_reset = len(env_indices)
             indices = torch.multinomial(weights, num_samples=num_to_reset, replacement=True)
 
-            self.current_pos[env_indices] = self.valid_centers[indices]
+            self.current_pos[env_indices] = self.valid_centers[indices] + (torch.rand_like(self.current_pos[env_indices])-0.5)*0.8
             self.start_indices[env_indices] = indices # 记录起始点索引 for reset envs
             self.initial_start_pos[env_indices] = self.current_pos[env_indices].clone() # 更新初始起点位置
         else:
@@ -560,7 +560,7 @@ class DiscreteRandomActionMaze(BaseMazeEnv):
         self.directions_list.append([0, 0])
         # 从directions_list的前16个动作中任选一个加上最后一个动作作为self._directions
         # 动作的步长范围为[0.5*self.step_length, self.step_length]
-        self._directions = torch.tensor(self.directions_list, device=self.device) * self.step_length
+        self._set_random_directions()
 
     def _convert_action(self, actions):
         if not isinstance(actions, torch.Tensor):
@@ -573,11 +573,11 @@ class DiscreteRandomActionMaze(BaseMazeEnv):
         return actions_sample
 
     def _set_random_directions(self):
-        """随机选择前16个方向,并设置到self._directions中"""
+        """随机选择前8个方向,并设置到self._directions中"""
         random_indices = torch.randperm(16, device=self.device)[:8]
         selected_directions = [self.directions_list[i] for i in random_indices.tolist()]
         selected_directions.append(self.directions_list[-1])
-        random_scales = (torch.rand(8, device=self.device) * 0.5 + 0.5).unsqueeze(-1) # 变成(16,1)
+        random_scales = (torch.rand(len(selected_directions), device=self.device) * 1.5 + 0.5).unsqueeze(-1) # 变成(16,1)
         self._directions = torch.tensor(selected_directions, device=self.device) * self.step_length * random_scales
 
 # 使用示例

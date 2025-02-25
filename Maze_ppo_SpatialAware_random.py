@@ -101,9 +101,6 @@ class Agent(nn.Module):
         super().__init__()
         obs_shape = envs.observation_space.shape[0]
         n_actions = envs.action_space.n
-
-        # 存储预设方向向量
-        self.register_buffer('_directions', envs._directions)
         
         # 共享主干网络
         self.backbone = nn.Sequential(
@@ -115,10 +112,12 @@ class Agent(nn.Module):
             nn.ELU()
         )
         
-        # 方向编码器 (关键修改点1)
+        # 方向编码器
         self.dir_encoder = nn.Sequential(
-            layer_init(nn.Linear(2, 32)),
-            nn.ELU()
+            layer_init(nn.Linear(2, 64)),  # 增加编码容量
+            nn.ELU(),
+            layer_init(nn.Linear(64, 32)),
+            nn.ELU(),
         )
         
         # 价值函数网络
@@ -137,11 +136,20 @@ class Agent(nn.Module):
     def get_value(self, x):
         return self.critic(self.backbone(x))
 
-    def get_action_prob_and_value(self, x, action=None):
-        latent = self.backbone(x)  # [batch, 32]
-        dir_features = self.dir_encoder(self._directions)  # [n_actions, 32]
+    def get_action_prob_and_value(self, x, directions, action=None):
+        # 输入维度:
+        # x: [batch_size, obs_dim]
+        # directions: [batch_size, num_actions, 2]
         
-        action_logits = torch.matmul(latent, dir_features.T)  # [batch, n_actions]
+        # 批量编码方向特征
+        batch_size, num_actions, _ = directions.shape
+        flat_directions = directions.view(-1, 2)  # [batch*num_actions, 2]
+        dir_features = self.dir_encoder(flat_directions)  # [batch*num_actions, 32]
+        dir_features = dir_features.view(batch_size, num_actions, -1)  # [batch, num_actions, 32]
+        
+        # 计算动作logits
+        latent = self.backbone(x)  # [batch, 32]
+        action_logits = torch.einsum('bd,bad->ba', latent, dir_features)  # 批量矩阵乘法
         
         # 添加温度约束（确保数值稳定性）
         clamped_temp = self.temperature.clamp(
@@ -151,6 +159,7 @@ class Agent(nn.Module):
 
         # 应用温度缩放
         scaled_logits = action_logits / clamped_temp
+        # scaled_logits = action_logits
 
         discrete_dist = Categorical(logits=scaled_logits)
         
@@ -159,10 +168,6 @@ class Agent(nn.Module):
         
         return action, discrete_dist.log_prob(action), discrete_dist.entropy(), self.critic(latent)
 
-    def to(self, device):
-        super().to(device)
-        self._directions = self._directions.to(device)
-        return self
 
 import atexit
 def exit_handler():
@@ -225,7 +230,7 @@ if __name__ == "__main__":
     # Import the Maze environment
     from env.Maze import Discrete4Maze,Discrete8Maze,Discrete16Maze,DiscreteRandomActionMaze
     step_length = 0.1
-    envs = Discrete8Maze(num_envs=args.num_envs, 
+    envs = DiscreteRandomActionMaze(num_envs=args.num_envs, 
                         render_mode="rgb_array" if args.capture_video else None,
                         device=device,
                         step_length=step_length,
@@ -254,6 +259,7 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.observation_space.shape).to(device) # Get obs shape from MazeEnv
+    directions = torch.zeros((args.num_steps, args.num_envs) + (envs.action_space.n, 2), dtype=torch.float32).to(device) # 存储可选的离散动作的真实数值
     actions = torch.zeros((args.num_steps, args.num_envs), dtype=torch.long).to(device) # 存储离散动作，类型为 long
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
@@ -282,8 +288,9 @@ if __name__ == "__main__":
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
+            directions[step,:]=envs._directions
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_prob_and_value(next_obs) # 获取动作、其在对应连续分布中的概率和价值
+                action, logprob, _, value = agent.get_action_prob_and_value(next_obs, directions[step,:]) # 获取动作、其在对应连续分布中的概率和价值
                 values[step] = value.flatten()
             actions[step] = action # 存储离散动作
             logprobs[step] = logprob
@@ -389,6 +396,7 @@ if __name__ == "__main__":
         # flatten the batch
         b_obs = obs.reshape((-1,) + envs.observation_space.shape) # Get obs shape from MazeEnv
         b_logprobs = logprobs.reshape(-1)
+        b_directions = directions.reshape((-1,) + (envs.action_space.n, 2))
         b_actions = actions.reshape(-1) # 离散动作空间，action shape 变为 (batch_size,)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
@@ -403,7 +411,7 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_prob_and_value(b_obs[mb_inds], b_actions[mb_inds]) # 传入离散动作
+                _, newlogprob, entropy, newvalue = agent.get_action_prob_and_value(b_obs[mb_inds], b_directions[mb_inds], b_actions[mb_inds]) # 传入离散动作
                 logratio = newlogprob - b_logprobs[mb_inds]
                 logratio = torch.clamp(logratio, max=20)
                 ratio = logratio.exp()
