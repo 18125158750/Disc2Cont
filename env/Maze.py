@@ -197,7 +197,7 @@ class BaseMazeEnv(gym.Env):
             num_to_reset = len(env_indices)
             indices = torch.multinomial(weights, num_samples=num_to_reset, replacement=True)
 
-            self.current_pos[env_indices] = self.valid_centers[indices] + (torch.rand_like(self.current_pos[env_indices])-0.5)*0.8
+            self.current_pos[env_indices] = self.valid_centers[indices] # + (torch.rand_like(self.current_pos[env_indices])-0.5)*0.8
             self.start_indices[env_indices] = indices # 记录起始点索引 for reset envs
             self.initial_start_pos[env_indices] = self.current_pos[env_indices].clone() # 更新初始起点位置
         else:

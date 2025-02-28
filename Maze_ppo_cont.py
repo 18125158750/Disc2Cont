@@ -403,7 +403,7 @@ if __name__ == "__main__":
                     v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+                loss = pg_loss*1 - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -421,6 +421,7 @@ if __name__ == "__main__":
         if args.track:
             wandb.log({ # Log remaining metrics to wandb
                 "charts/learning_rate": optimizer.param_groups[0]["lr"],
+                "losses/total_loss": loss.item(),
                 "losses/value_loss": v_loss.item(),
                 "losses/policy_loss": pg_loss.item(),
                 "losses/entropy": entropy_loss.item(),
